@@ -41,8 +41,8 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # --- Клиент DeepSeek ---
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-flash"
+DEEPSEEK_BASE_URL = "https://api.zveno.ai/v1"
+DEEPSEEK_MODEL = "deepseek/deepseek-v4.1-flash"
 
 http_timeout = httpx.Timeout(
     timeout=60.0,
@@ -59,7 +59,7 @@ ai_client = AsyncOpenAI(
 )
 
 
-async def ask_ai(prompt: str, system: str = "Ты — терпеливый репетитор. Объясняй кратко, по делу, на русском.") -> str:
+async def ask_ai(prompt: str, system: str = "Ты — терпеливый репетитор. Объясняй максимально кратко, по делу, на русском. Не используй формулы так как они не видны в телеграмме.") -> str:
     """Запрос к DeepSeek с обработкой ошибок."""
     try:
         resp = await ai_client.chat.completions.create(
@@ -69,9 +69,15 @@ async def ask_ai(prompt: str, system: str = "Ты — терпеливый ре�
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
-            max_tokens=500,
+            max_tokens=800,  # Увеличиваем лимит, чтобы модель не обрывалась на полуслове
         )
-        return resp.choices[0].message.content.strip()
+
+        # Безопасно достаем текст
+        content = resp.choices[0].message.content
+        if content:
+            return content.strip()
+        else:
+            return "❌ ИИ вернул пустой ответ. Попробуй переформулировать тему."
 
     except APITimeoutError:
         logging.warning("DeepSeek: таймаут")
@@ -2567,6 +2573,7 @@ def sm2_update(st: dict, quality: int) -> dict:
 # ---------- Состояния ----------
 class CardFlow(StatesGroup):
     waiting_answer = State()
+    waiting_for_custom_topic = State() # Новое состояние для ввода своей темы
 
 
 # ---------- Клавиатуры навигации ----------
@@ -2621,6 +2628,8 @@ def topics_kb(exam: str, subj: str) -> InlineKeyboardMarkup:
                     text=t["title"],
                     callback_data=f"topic:{exam}:{subj}:{tid}",
                 )])
+    rows.append([InlineKeyboardButton(text="✍️ Спросить ИИ по своей теме", callback_data="custom_topic:ask")])
+
     rows.append([InlineKeyboardButton(text="⬅️ К предметам", callback_data=f"exam:{exam}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2635,6 +2644,90 @@ def theory_kb(exam: str, subj: str) -> InlineKeyboardMarkup:
     )
 
 
+@dp.callback_query(F.data == "custom_topic:ask")
+async def on_custom_topic_ask(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    exam, subj = data.get("exam"), data.get("subject")
+
+    if not exam or not subj:
+        await cb.answer("Сначала выбери экзамен и предмет.", show_alert=True)
+        return
+
+    await state.set_state(CardFlow.waiting_for_custom_topic)
+    await cb.message.edit_text(
+        "✍️ <b>Напиши тему, которую хочешь разобрать.</b>\n\n"
+        "Например: «Закон Ома», «Сложные проценты» или «Правописание приставок».\n\n"
+        "ИИ объяснит её простыми словами, без карточек.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"subj:{exam}:{subj}")]
+        ])
+    )
+    await cb.answer()
+
+
+@dp.message(CardFlow.waiting_for_custom_topic, F.text)
+async def on_custom_topic_text(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    exam, subj = data.get("exam"), data.get("subject")
+    exam_name = EXAMS.get(exam, "экзамен")
+    subj_name = SUBJECTS.get(subj, "предмет")
+    user_topic = msg.text.strip()
+
+    if len(user_topic) < 3:
+        await msg.answer("Тема слишком короткая. Напиши чуть подробнее.")
+        return
+
+    await msg.answer("⏳ <i>ИИ готовит объяснение... Это может занять пару секунд.</i>", parse_mode="HTML")
+
+    system_prompt = (
+        "Ты — краткий справочник. Отвечай строго по делу, без приветствий и вступлений. "
+        "ВАЖНО: Telegram не поддерживает LaTeX, MathJax и сложные математические символы. "
+        "Пиши все формулы ТОЛЬКО обычными текстовыми символами (например: x^2, v = s / t, F = m * a, корень из x). "
+        "ЗАПРЕЩЕНО использовать символы $, \\[ \\], \\frac, \\sqrt и подобные."
+    )
+    prompt = (
+        f"Тема: «{user_topic}» (Экзамен: {exam_name}, Предмет: {subj_name}).\n\n"
+        f"Выдай информацию строго по следующему шаблону, без воды:\n"
+        f"<b>📌 Определение:</b> (кратко, 1-2 предложения)\n"
+        f"<b>📐 Формула:</b> (если есть, напиши её ОБЫЧНЫМИ буквами и знаками, например: F = m * a. Никаких LaTeX-скобок и сложных символов. Если формулу нельзя записать текстом — напиши 'Словами: ...')\n"
+        f"<b>📏 Единица измерения:</b> (в системе СИ, если есть, если нет — напиши 'Нет')\n\n"
+        f"Никаких примеров, вступлений и прощаний. Только эти три пункта."
+    )
+
+    answer = await ask_ai(prompt, system=system_prompt)
+
+    # Если ответ пустой или содержит только пробелы — просим переформулировать
+    if not answer or not answer.strip():
+        await msg.answer(
+            "🤔 ИИ не смог сгенерировать объяснение (возможно, сработал фильтр). Попробуй написать тему по-другому.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✍️ Спросить другую тему", callback_data="custom_topic:ask")],
+                [InlineKeyboardButton(text="⬅️ К темам", callback_data=f"subj:{exam}:{subj}")]
+            ])
+        )
+        return  # Прерываем выполнение, чтобы не отправлять пустое сообщение
+
+    # Обрезаем, если ответ  слишком длинный
+    safe_answer = escape(answer)
+    if len(safe_answer) > 3500:
+        safe_answer = safe_answer[:3500] + "\n\n... (текст обрезан)"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Спросить другую тему", callback_data="custom_topic:ask")],
+        [InlineKeyboardButton(text="⬅️ К темам", callback_data=f"subj:{exam}:{subj}")],
+        [InlineKeyboardButton(text="🏠 В начало", callback_data="back:exam")]
+    ])
+
+    # Сбрасываем состояние, чтобы бот снова реагировал на кнопки
+    await state.set_state(None)
+
+    safe_topic = escape(user_topic)
+    await msg.answer(
+        f"🤖 <b>Объяснение темы «{safe_topic}»:</b>\n\n{safe_answer}",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
 # ---------- /start ----------
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -2648,6 +2741,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "2. Можешь сначала повторить теорию, а можешь сразу к карточкам.\n"
         "3. На карточке либо <b>пишешь ответ</b>, либо <b>выбираешь из вариантов</b>, "
         "либо жмёшь <b>⏭ Пропустить</b>.\n"
+        "   Если не уверен — жми <b>🤖 Спросить ИИ</b>, он объяснит ответ, и карточка не засчитается.\n"
         "4. В любой момент можно нажать <b>🏁 Закончить</b> или ввести /stop.\n"
         "5. Алгоритм SM-2 сам решает, когда показать карточку снова.\n\n"
         "К чему готовимся? 👇"
@@ -2870,12 +2964,42 @@ async def on_card_ai(cb: CallbackQuery, state: FSMContext):
     )
     answer = await ask_ai(prompt)
 
-    await cb.message.answer(
-        f"🤖 <b>Объяснение ИИ:</b>\n\n{escape(answer)}",
-        parse_mode="HTML",
+    # Обрезаем ответ, чтобы не превысить лимиты Telegram
+    safe_answer = escape(answer)
+    if len(safe_answer) > 2500:
+        safe_answer = safe_answer[:2500] + "\n\n... (текст обрезан)"
+
+    # 1. Начисляем "провал" в SM-2
+    user_id = data.get("user_id")
+    key = (user_id, exam, subj, tid, idx)
+    st = CARD_STATES.get(key, {"rep": 0, "interval": 1.0, "ef": 2.5})
+    sm2_update(st, 1)  # 1 = провал
+    CARD_STATES[key] = st
+
+    # 2. Двигаем очередь (убираем текущую, кидаем в конец)
+    queue = data.get("queue") or []
+    queue = queue[1:]
+    queue.append(idx)
+    await state.update_data(queue=queue)
+
+    # 3. Показываем ТОЛЬКО объяснение и новые кнопки
+    text = (
+        f"🤖 <b>Объяснение ИИ:</b>\n\n{safe_answer}\n\n"
+        f"━━━━━━━━━━━━\n"
+        f"❌ <i>Карточка засчитана как проваленная и будет показана позже.</i>"
     )
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Следующая карточка", callback_data="card:next")],
+        [InlineKeyboardButton(text="🏁 Закончить", callback_data="card:finish")]
+    ])
 
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+@dp.callback_query(F.data == "card:next")
+async def on_card_next(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    # Эта функция просто вызывает показ следующей карточки из очереди
+    await show_card(cb.bot, cb.message.chat.id, cb.message.message_id, state)
 @dp.callback_query(F.data == "gen:more")
 async def on_gen_more(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -2896,7 +3020,10 @@ async def on_gen_more(cb: CallbackQuery, state: FSMContext):
         f"🤖 <b>Новые вопросы от ИИ (проверь их сам):</b>\n\n{escape(raw)}",
         parse_mode="HTML",
     )
-
+@dp.callback_query(F.data == "card:continue")
+async def on_card_continue(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await show_card(cb.bot, cb.message.chat.id, cb.message.message_id, state)
 
 @dp.callback_query(F.data == "card:finish")
 async def on_finish(cb: CallbackQuery, state: FSMContext):
@@ -2934,7 +3061,7 @@ async def on_finish(cb: CallbackQuery, state: FSMContext):
 
 
 # ---------- Обработка ответа ----------
-async def process_answer(bot: Bot, state: FSMContext, correct: bool, user_answer, quality: int):
+async def process_answer(bot: Bot, state: FSMContext, correct: bool, user_answer, quality: int, custom_prefix: str = None):
     data = await state.get_data()
     exam, subj, tid = data["exam"], data["subject"], data["topic"]
     idx = data["current_card_idx"]
@@ -2951,7 +3078,9 @@ async def process_answer(bot: Bot, state: FSMContext, correct: bool, user_answer
     safe_ua = escape(str(user_answer)) if user_answer is not None else ""
     safe_ans = escape(str(card["answer"]))
 
-    if correct:
+    if custom_prefix:
+        prefix = custom_prefix
+    elif correct:
         prefix = f"✅ <b>Верно!</b>\nТвой ответ: <i>{safe_ua}</i>"
     elif quality == 0:
         prefix = f"⏭ <b>Пропущено.</b>\nПравильный ответ: <b>{safe_ans}</b>"
