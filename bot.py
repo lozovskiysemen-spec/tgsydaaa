@@ -45,17 +45,17 @@ DEEPSEEK_BASE_URL = "https://api.zveno.ai/v1"
 DEEPSEEK_MODEL = "deepseek/deepseek-v4.1-flash"
 
 http_timeout = httpx.Timeout(
-    timeout=60.0,
-    connect=15.0,
-    read=30.0,
-    write=10.0,
+    timeout=120.0,  # Общий таймаут на весь запрос (2 минуты)
+    connect=30.0,   # Таймаут на установку соединения (30 секунд)
+    read=60.0,      # Таймаут на чтение ответа (1 минута)
+    write=30.0      # Таймаут на отправку запроса (30 секунд)
 )
 
 ai_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url=DEEPSEEK_BASE_URL,
     http_client=httpx.AsyncClient(timeout=http_timeout),
-    max_retries=2,
+    max_retries=0  # Временно отключаем повторы
 )
 
 
