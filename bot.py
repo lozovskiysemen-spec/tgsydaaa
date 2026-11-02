@@ -6,7 +6,7 @@ from html import escape
 from datetime import datetime, timedelta
 import httpx
 from openai import AsyncOpenAI, APITimeoutError, APIConnectionError, APIStatusError
-
+from aiogram.exceptions import TelegramBadRequest
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -2943,6 +2943,7 @@ async def show_card(bot: Bot, chat_id: int, message_id: int, state: FSMContext, 
 
 
 @dp.callback_query(F.data == "card:ai")
+@dp.callback_query(F.data == "card:ai")
 async def on_card_ai(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     exam, subj, tid = data.get("exam"), data.get("subject"), data.get("topic")
@@ -2952,9 +2953,15 @@ async def on_card_ai(cb: CallbackQuery, state: FSMContext):
         await cb.answer("Сначала открой карточку.", show_alert=True)
         return
 
-    card = TOPICS[exam][subj][tid]["cards"][idx]
+    # 1. СРАЗУ убираем кнопки, чтобы пользователь не нажал второй раз, пока ИИ думает
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
     await cb.answer("🤖 Думаю...")
 
+    card = TOPICS[exam][subj][tid]["cards"][idx]
     prompt = (
         f"Тема: {TOPICS[exam][subj][tid]['title']}\n"
         f"Вопрос: {card['front']}\n"
@@ -2964,37 +2971,41 @@ async def on_card_ai(cb: CallbackQuery, state: FSMContext):
     )
     answer = await ask_ai(prompt)
 
-    # Обрезаем ответ, чтобы не превысить лимиты Telegram
     safe_answer = escape(answer)
     if len(safe_answer) > 2500:
         safe_answer = safe_answer[:2500] + "\n\n... (текст обрезан)"
 
-    # 1. Начисляем "провал" в SM-2
+    # 2. Начисляем "провал" в SM-2
     user_id = data.get("user_id")
     key = (user_id, exam, subj, tid, idx)
     st = CARD_STATES.get(key, {"rep": 0, "interval": 1.0, "ef": 2.5})
     sm2_update(st, 1)  # 1 = провал
     CARD_STATES[key] = st
 
-    # 2. Двигаем очередь (убираем текущую, кидаем в конец)
+    # 3. Двигаем очередь
     queue = data.get("queue") or []
     queue = queue[1:]
     queue.append(idx)
     await state.update_data(queue=queue)
 
-    # 3. Показываем ТОЛЬКО объяснение и новые кнопки
+    # 4. Показываем объяснение
     text = (
         f"🤖 <b>Объяснение ИИ:</b>\n\n{safe_answer}\n\n"
         f"━━━━━━━━━━━━\n"
         f"❌ <i>Карточка засчитана как проваленная и будет показана позже.</i>"
     )
-
+    
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Следующая карточка", callback_data="card:next")],
         [InlineKeyboardButton(text="🏁 Закончить", callback_data="card:finish")]
     ])
 
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    # 5. Безопасно редактируем сообщение
+    try:
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            logging.error(f"Ошибка при редактировании сообщения ИИ: {e}")
 @dp.callback_query(F.data == "card:next")
 async def on_card_next(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
